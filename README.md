@@ -1,3 +1,12 @@
+# GePPETTO-CUT
+
+This fork is the adaptation of the Contrastive Unpaired Translation to the GePPETTO-DET generative framework. We add:
+- Custom data management for our application
+- A custom loss for texture conditioning
+- A connector for integrated usage of CUT into GePPETTO-DET
+
+---
+---
 
 
 # Contrastive Unpaired Translation (CUT)

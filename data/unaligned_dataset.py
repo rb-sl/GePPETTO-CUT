@@ -4,6 +4,7 @@ from data.image_folder import make_dataset
 from PIL import Image
 import random
 import util.util as util
+import numpy as np
 
 
 class UnalignedDataset(BaseDataset):
@@ -55,18 +56,21 @@ class UnalignedDataset(BaseDataset):
         else:   # randomize the index for domain B to avoid fixed pairs.
             index_B = random.randint(0, self.B_size - 1)
         B_path = self.B_paths[index_B]
-        A_img = Image.open(A_path).convert('RGB')
-        B_img = Image.open(B_path).convert('RGB')
-
+        A_img = np.array(Image.open(A_path).convert('L'))
+        B_img = np.array(Image.open(B_path).convert('L'))
+        
+        A_img = Image.fromarray(np.clip(A_img, 0, np.max(B_img)).astype(np.uint8)).convert("RGB")
+        B_img = Image.fromarray(B_img).convert("RGB")
         # Apply image transformation
         # For CUT/FastCUT mode, if in finetuning phase (learning rate is decaying),
         # do not perform resize-crop data augmentation of CycleGAN.
         is_finetuning = self.opt.isTrain and self.current_epoch > self.opt.n_epochs
         modified_opt = util.copyconf(self.opt, load_size=self.opt.crop_size if is_finetuning else self.opt.load_size)
-        transform = get_transform(modified_opt)
-        A = transform(A_img)
-        B = transform(B_img)
+        transform = get_transform(modified_opt, grayscale=True)
 
+        A = transform(A_img)
+        B = transform(B_img)    
+        
         return {'A': A, 'B': B, 'A_paths': A_path, 'B_paths': B_path}
 
     def __len__(self):

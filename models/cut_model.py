@@ -4,6 +4,7 @@ from .base_model import BaseModel
 from . import networks
 from .patchnce import PatchNCELoss
 import util.util as util
+import torch.nn.functional as F
 
 
 class CUTModel(BaseModel):
@@ -21,7 +22,7 @@ class CUTModel(BaseModel):
         """
         parser.add_argument('--CUT_mode', type=str, default="CUT", choices='(CUT, cut, FastCUT, fastcut)')
 
-        parser.add_argument('--lambda_GAN', type=float, default=1.0, help='weight for GAN loss：GAN(G(X))')
+        parser.add_argument('--lambda_GAN', type=float, default=1.0, help='weight for GAN loss: GAN(G(X))')
         parser.add_argument('--lambda_NCE', type=float, default=1.0, help='weight for NCE loss: NCE(G(X), X)')
         parser.add_argument('--nce_idt', type=util.str2bool, nargs='?', const=True, default=False, help='use NCE loss for identity mapping: NCE(G(Y), Y))')
         parser.add_argument('--nce_layers', type=str, default='0,4,8,12,16', help='compute NCE loss on which layers')
@@ -58,7 +59,7 @@ class CUTModel(BaseModel):
 
         # specify the training losses you want to print out.
         # The training/test scripts will call <BaseModel.get_current_losses>
-        self.loss_names = ['G_GAN', 'D_real', 'D_fake', 'G', 'NCE']
+        self.loss_names = ['G_GAN', 'D_real', 'D_fake', 'G', 'NCE', "COLOR", "INSTMEAN", "BGMEAN", "BGOVER", "FGUNDER"]
         self.visual_names = ['real_A', 'fake_B', 'real_B']
         self.nce_layers = [int(i) for i in self.opt.nce_layers.split(',')]
 
@@ -192,7 +193,9 @@ class CUTModel(BaseModel):
         else:
             loss_NCE_both = self.loss_NCE
 
-        self.loss_G = self.loss_G_GAN + loss_NCE_both
+        self.loss_COLOR = self.calculate_color_loss(self.real_A, self.fake_B)
+
+        self.loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_COLOR
         return self.loss_G
 
     def calculate_NCE_loss(self, src, tgt):
@@ -212,3 +215,117 @@ class CUTModel(BaseModel):
             total_nce_loss += loss.mean()
 
         return total_nce_loss / n_layers
+    
+    def calculate_color_loss(self, src, tgt,
+                            l_instance=1e1,
+                            l_bg_mean=1e1,
+                            l_bg_bright = 1e-1,
+                            l_fg_dark = 1e0):
+        src_unique = torch.unique(src, sorted=True)
+        if len(src_unique) > 1:
+            thresh = (src_unique[0] + src_unique[1]) / 2
+        else:
+            thresh = src_unique[0] + 1e-8
+        
+        # Ensure same device/dtype
+        device = tgt.device
+        dtype = tgt.dtype
+
+        # If batched, we'll handle batch as single long vector but keep per-image separation
+        if tgt.dim() == 2:
+            B = 1
+            src = src.unsqueeze(0)
+            tgt = tgt.unsqueeze(0)
+        else:
+            B = tgt.size(0)
+
+        # flatten per image
+        src_flat = src.reshape(B, -1)
+        tgt_flat = tgt.reshape(B, -1)
+
+        total_instance_loss = torch.tensor(0.0, device=device, dtype=dtype)
+        # We'll accumulate per-batch background terms and normalize by batch
+        total_bg_mean_loss = torch.tensor(0.0, device=device, dtype=dtype)
+        total_bg_bright_loss = torch.tensor(0.0, device=device, dtype=dtype)
+        total_fg_dark_loss = torch.tensor(0.0, device=device, dtype=dtype)
+        
+        for i in range(B):
+            s = src_flat[i]
+            t = tgt_flat[i]
+
+            # identify background label (min)
+            bg_label = s.min()
+
+            # ---------------- Instance loss (exclude background)
+            unique_ids, inverse_idx = torch.unique(s, return_inverse=True)
+            # mask of non-background
+            mask_ids = unique_ids[unique_ids != bg_label]
+
+            if mask_ids.numel() > 0:
+                # restrict to pixels not background
+                nonbg_mask = (s != bg_label)
+                inv_nb = inverse_idx[nonbg_mask]         # indices into unique_ids
+                t_nb = t[nonbg_mask]
+
+                # remap inv_nb (which references positions in unique_ids) to 0..K-1
+                _, remapped = torch.unique(inv_nb, return_inverse=True)
+                K = mask_ids.numel()
+                sums = torch.zeros(K, device=device, dtype=dtype)
+                counts = torch.zeros(K, device=device, dtype=dtype)
+
+                sums.scatter_add_(0, remapped, t_nb)
+                counts.scatter_add_(0, remapped, torch.ones_like(t_nb, dtype=dtype))
+                means = sums / counts.clamp_min(1.0)
+
+                # mask_ids holds the target intensity for each instance (assumed already in same scale)
+                target_vals = mask_ids.to(dtype)
+                inst_loss = F.mse_loss(means, target_vals.to(means))
+
+            else:
+                inst_loss = torch.tensor(0.0, device=device, dtype=dtype)
+
+            total_instance_loss += inst_loss
+
+            # ---------------- Background mean + variance
+            bg_mask = (s == bg_label)
+            if bg_mask.any():
+                t_bg = t[bg_mask]
+                bg_mean = t_bg.mean()
+
+                # mean loss (compare to bg_label)
+                bg_mean_loss = F.mse_loss(bg_mean, bg_label.to(dtype))
+                total_bg_mean_loss += bg_mean_loss
+            else:
+                # no background pixels (unlikely) -> zeros
+                total_bg_mean_loss += torch.tensor(0.0, device=device, dtype=dtype)
+
+            # Background over-threshold penalty
+            bg_over = F.relu(t_bg - thresh)
+            bg_over_loss = (bg_over ** 2).sum()
+
+            # Foreground under-threshold penalty
+            if mask_ids.numel() > 0:
+                t_fg = t[nonbg_mask]
+                fg_under = F.relu(thresh - t_fg)
+                fg_under_loss = (fg_under ** 2).sum()
+            else:
+                fg_under_loss = torch.tensor(0.0, device=device, dtype=dtype)
+
+            # Accumulate
+            total_bg_bright_loss += bg_over_loss
+            total_fg_dark_loss += fg_under_loss
+
+        # average over batch
+        self.loss_INSTMEAN = l_instance * total_instance_loss / float(B)
+        self.loss_BGMEAN = l_bg_mean *  total_bg_mean_loss / float(B)
+        self.loss_BGOVER = l_bg_bright * total_bg_bright_loss / float(B)
+        self.loss_FGUNDER = l_fg_dark * total_fg_dark_loss / float(B)
+
+        total_loss = (
+            self.loss_INSTMEAN
+            + self.loss_BGMEAN
+            + self.loss_BGOVER
+            + self.loss_FGUNDER
+        )
+
+        return total_loss
