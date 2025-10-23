@@ -219,8 +219,8 @@ class CUTModel(BaseModel):
     def calculate_color_loss(self, src, tgt,
                             l_instance=1e1,
                             l_bg_mean=1e1,
-                            l_bg_bright = 1e-1,
-                            l_fg_dark = 1e0):
+                            l_bg_bright=1e-1,
+                            l_fg_dark=1e0):
         src_unique = torch.unique(src, sorted=True)
         if len(src_unique) > 1:
             thresh = (src_unique[0] + src_unique[1]) / 2
