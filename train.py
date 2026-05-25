@@ -4,7 +4,7 @@ from options.train_options import TrainOptions
 from data import create_dataset
 from models import create_model
 from util.visualizer import Visualizer
-
+from pathlib import Path
 
 if __name__ == '__main__':
     opt = TrainOptions().parse()   # get training options
@@ -21,6 +21,8 @@ if __name__ == '__main__':
     optimize_time = 0.1
 
     times = []
+    best_G_loss = 10
+    best_sam_loss = 10
     for epoch in range(opt.epoch_count, opt.n_epochs + opt.n_epochs_decay + 1):    # outer loop for different epochs; we save the model by <epoch_count>, <epoch_count>+<save_latest_freq>
         epoch_start_time = time.time()  # timer for entire epoch
         iter_data_time = time.time()    # timer for data loading per iteration
@@ -44,7 +46,7 @@ if __name__ == '__main__':
                 model.setup(opt)               # regular setup: load and print networks; create schedulers
                 model.parallelize()
             model.set_input(data)  # unpack data from dataset and apply preprocessing
-            model.optimize_parameters()   # calculate loss functions, get gradients, update network weights
+            model.optimize_parameters(epoch=epoch)   # calculate loss functions, get gradients, update network weights
             if len(opt.gpu_ids) > 0:
                 torch.cuda.synchronize()
             optimize_time = (time.time() - optimize_start_time) / batch_size * 0.005 + 0.995 * optimize_time
@@ -67,6 +69,24 @@ if __name__ == '__main__':
                 model.save_networks(save_suffix)
 
             iter_data_time = time.time()
+        
+        epoch_losses = model.get_current_losses()
+
+        if epoch_losses['G'] < best_G_loss:
+            for f in Path(model.save_dir).glob("*best_G*"):
+                f.unlink() 
+            save_suffix = f"best_G_{epoch}"
+            model.save_networks(save_suffix)
+            best_G_loss = epoch_losses['G']
+            print(f"Saved best G_loss model ({save_suffix})")
+
+        if epoch_losses['SAM'] < best_sam_loss and epoch_losses['SAM'] > 0:
+            for f in Path(model.save_dir).glob("*best_SAM*"):
+                f.unlink() 
+            save_suffix = f"best_SAM_{epoch}"
+            model.save_networks(save_suffix)
+            best_sam_loss = epoch_losses['SAM']
+            print(f"Saved best SAM_loss model ({save_suffix})")
 
         if epoch % opt.save_epoch_freq == 0:              # cache our model every <save_epoch_freq> epochs
             print('saving the model at the end of epoch %d, iters %d' % (epoch, total_iters))

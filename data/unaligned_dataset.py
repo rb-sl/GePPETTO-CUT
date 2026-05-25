@@ -69,7 +69,7 @@ class UnalignedDataset(BaseDataset):
         transform = get_transform(modified_opt, grayscale=True)
 
         A = transform(A_img)
-        B = transform(B_img)    
+        B = transform(B_img)
         
         return {'A': A, 'B': B, 'A_paths': A_path, 'B_paths': B_path}
 

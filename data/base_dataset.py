@@ -6,7 +6,8 @@ import random
 import numpy as np
 import torch.utils.data as data
 from PIL import Image
-import torchvision.transforms as transforms
+import torchvision.transforms.v2 as transforms
+import torch
 from abc import ABC, abstractmethod
 
 
@@ -123,7 +124,8 @@ def get_transform(opt, params=None, grayscale=False, method=Image.BICUBIC, conve
             transform_list.append(transforms.Lambda(lambda img: __flip(img, params['flip'])))
 
     if convert:
-        transform_list += [transforms.ToTensor()]
+        # transform_list += [transforms.ToTensor()]
+        transform_list += [transforms.ToImage(), transforms.ToDtype(torch.float32, scale=True)]
         if grayscale:
             transform_list += [transforms.Normalize((0.5,), (0.5,))]
         else:
