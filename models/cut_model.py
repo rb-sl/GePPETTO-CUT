@@ -11,6 +11,8 @@ from segment_anything import sam_model_registry
 from torchvision.ops import sigmoid_focal_loss
 from scipy.optimize import linear_sum_assignment
 
+import torch.nn as nn
+
 class CUTModel(BaseModel):
     """ This class implements CUT and FastCUT model, described in the paper
     Contrastive Learning for Unpaired Image-to-Image Translation
@@ -63,7 +65,7 @@ class CUTModel(BaseModel):
 
         # specify the training losses you want to print out.
         # The training/test scripts will call <BaseModel.get_current_losses>
-        self.loss_names = ['G_GAN', 'D_real', 'D_fake', 'G', 'NCE', "SAM"]
+        self.loss_names = ['G_GAN', 'D_real', 'D_fake', 'G', 'NCE', "SAM", "tp_SAM", "fp_SAM", "G_cond", "D_cond"]
         self.visual_names = ['real_A', 'fake_B', 'real_B']
         self.nce_layers = [int(i) for i in self.opt.nce_layers.split(',')]
 
@@ -80,8 +82,16 @@ class CUTModel(BaseModel):
         self.netG = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.normG, not opt.no_dropout, opt.init_type, opt.init_gain, opt.no_antialias, opt.no_antialias_up, self.gpu_ids, opt)
         self.netF = networks.define_F(opt.input_nc, opt.netF, opt.normG, not opt.no_dropout, opt.init_type, opt.init_gain, opt.no_antialias, self.gpu_ids, opt)
 
+        self.print_receptive_field(self.netG, "Generator")
+
         if self.isTrain:
             self.netD = networks.define_D(opt.output_nc, opt.ndf, opt.netD, opt.n_layers_D, opt.normD, opt.init_type, opt.init_gain, opt.no_antialias, self.gpu_ids, opt)
+            self.print_receptive_field(self.netD, "Unconditional discriminator")
+
+            cond_input_nc = opt.input_nc + opt.output_nc
+            self.netD_cond = networks.define_D(cond_input_nc, opt.ndf, opt.netD, opt.n_layers_D, opt.normD, opt.init_type, opt.init_gain, opt.no_antialias, self.gpu_ids, opt)
+            self.print_receptive_field(self.netD_cond, "Conditional discriminator")
+
 
             # define loss functions
             self.criterionGAN = networks.GANLoss(opt.gan_mode).to(self.device)
@@ -93,11 +103,13 @@ class CUTModel(BaseModel):
             self.criterionIdt = torch.nn.L1Loss().to(self.device)
             self.optimizer_G = torch.optim.Adam(self.netG.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
             self.optimizer_D = torch.optim.Adam(self.netD.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
+            self.optimizer_D_cond = torch.optim.Adam(self.netD_cond.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
             self.optimizers.append(self.optimizer_G)
             self.optimizers.append(self.optimizer_D)
+            self.optimizers.append(self.optimizer_D_cond)
             
             # self.SAM = SAM("sam2_b.pt")
-            self.SAM = sam_model_registry["vit_b"](checkpoint="sam_vit_b_01ec64.pth")
+            self.SAM = sam_model_registry["vit_b"](checkpoint="sam_vit_b_01ec64.pth" if not hasattr(opt, 'sam_path') else opt.sam_path)
             self.SAM.to(self.device)
             for param in self.SAM.parameters():
                 param.requires_grad = False
@@ -115,8 +127,9 @@ class CUTModel(BaseModel):
         self.set_input(data)
         self.real_A = self.real_A[:bs_per_gpu]
         self.real_B = self.real_B[:bs_per_gpu]
-        self.centroids_A = self.centroids_A[:bs_per_gpu]
-        self.exploded_A = self.exploded_A[:bs_per_gpu]
+        if hasattr(self, "centroids_A"):
+            self.centroids_A = self.centroids_A[:bs_per_gpu]
+            self.exploded_A = self.exploded_A[:bs_per_gpu]
         self.forward()                     # compute fake images: G(A)
         if self.opt.isTrain:
             self.compute_D_loss().backward()                  # calculate gradients for D
@@ -131,13 +144,16 @@ class CUTModel(BaseModel):
 
         # update D
         self.set_requires_grad(self.netD, True)
+        self.set_requires_grad(self.netD_cond, True)
         self.optimizer_D.zero_grad()
-        self.loss_D = self.compute_D_loss()
-        self.loss_D.backward()
+        self.optimizer_D_cond.zero_grad()
+        self.compute_D_loss().backward()
         self.optimizer_D.step()
+        self.optimizer_D_cond.step()
 
         # update G
         self.set_requires_grad(self.netD, False)
+        self.set_requires_grad(self.netD_cond, False)
         self.optimizer_G.zero_grad()
         if self.opt.netF == 'mlp_sample':
             self.optimizer_F.zero_grad()
@@ -156,8 +172,12 @@ class CUTModel(BaseModel):
         AtoB = self.opt.direction == 'AtoB'
         self.real_A = input['A' if AtoB else 'B'].to(self.device)
         self.real_B = input['B' if AtoB else 'A'].to(self.device)
-        self.centroids_A = input["A_centroids"]
-        self.exploded_A = input["A_exploded"]
+        if 'A_paired' in input.keys():
+            self.A_paired = input['A_paired'].to(self.device)
+            self.B_paired = input['B_paired'].to(self.device)
+        if 'A_centroids' in input.keys():
+            self.centroids_A = input["A_centroids"]
+            self.exploded_A = input["A_exploded"]
         self.image_paths = input['A_paths' if AtoB else 'B_paths']
 
     def forward(self):
@@ -186,7 +206,27 @@ class CUTModel(BaseModel):
 
         # combine loss and calculate gradients
         self.loss_D = (self.loss_D_fake + self.loss_D_real) * 0.5
-        return self.loss_D
+
+        self.loss_D_cond = 0.0
+            
+        # Only compute this if paired data was provided in this batch
+        if hasattr(self, 'A_paired') and hasattr(self, 'B_paired'):
+            # Generate fake image from the PAIRED mask
+            fake_B_paired = self.netG(self.A_paired)
+            
+            # Concatenate Mask + Fake Image
+            fake_AB = torch.cat((self.A_paired, fake_B_paired), dim=1)
+            pred_fake_cond = self.netD_cond(fake_AB.detach())
+            loss_D_cond_fake = self.criterionGAN(pred_fake_cond, False).mean()
+
+            # Concatenate Mask + Real Image
+            real_AB = torch.cat((self.A_paired, self.B_paired), dim=1)
+            pred_real_cond = self.netD_cond(real_AB)
+            loss_D_cond_real = self.criterionGAN(pred_real_cond, True).mean()
+            
+            self.loss_D_cond = (loss_D_cond_fake + loss_D_cond_real) * 0.5
+        
+        return self.loss_D + self.loss_D_cond
 
     def compute_G_loss(self, epoch):
         """Calculate GAN and NCE loss for the generator"""
@@ -209,157 +249,20 @@ class CUTModel(BaseModel):
         else:
             loss_NCE_both = self.loss_NCE
 
+        # 2. Fool Conditional D (Structure)
+        self.loss_G_cond = 0.0
+        if hasattr(self, 'A_paired') and hasattr(self, 'B_paired'):
+            fake_B_paired = self.netG(self.A_paired)
+            fake_AB = torch.cat((self.A_paired, fake_B_paired), dim=1)
+            
+            # Generator wants D_cond to classify this as TRUE
+            # We apply a HIGH weight (e.g., lambda_cond = 5.0) because 
+            # paired data is rare and must be respected!
+            lambda_cond = 5.0 
+            self.loss_G_cond = self.criterionGAN(self.netD_cond(fake_AB), True).mean() * lambda_cond
+
         # TODO assuming batch = 1
 
-        # with torch.no_grad():
-            # rgb_transform = transforms.RGB()
-            # image = rgb_transform(self.fake_B) #.contiguous()
-        #     img_np = image[0].permute(1, 2, 0).cpu().detach().numpy().copy()
-        #     print(image.shape)
-        #     # self.loss_COLOR = self.calculate_color_loss(self.real_A, self.fake_B)
-        #     sam_output = self.SAM(img_np, points=self.centroids_A)
-
-        # with torch.no_grad():
-        # 2. Check your normalization!
-        # GANs often output [-1, 1]. If you pass a tensor directly, SAM expects [0, 1].
-        # (If your transforms.RGB() already outputs [0, 1], you can remove this block)
-
-        # if fake.min() < 0:
-        # fake = (fake + 1.0) / 2.0
-        
-        # rgb_transform = transforms.RGB()
-        # image = rgb_transform(fake)
-        # # img_tensor = image.detach()
-
-        # # 3. Manually resize to SAM's required 1024x1024 resolution
-        # img_1024 = F.interpolate(image, size=(1024, 1024), mode='bilinear', align_corners=False)
-
-        # # ==========================================
-        # # 5. Format Prompts (Force N independent masks)
-        # # ==========================================
-        # scaled_centroids = (self.centroids_A * 4.0).to(fake.device)
-
-        # # Reshape from (1, N, 2) -> (N, 1, 2)
-        # if scaled_centroids.dim() == 3 and scaled_centroids.shape[0] == 1:
-        #     scaled_centroids = scaled_centroids.squeeze(0).unsqueeze(1)
-        # elif scaled_centroids.dim() == 2:
-        #     scaled_centroids = scaled_centroids.unsqueeze(1)
-
-        # N = scaled_centroids.shape[0]
-
-        # # Create 1 label per point: (N, 1)
-        # point_labels = torch.ones((N, 1), dtype=torch.long, device=fake.device)
-
-        # # Package them as a tuple
-        # points = (scaled_centroids, point_labels)
-
-        # # ==========================================
-        # # THE DIFFERENTIABLE FORWARD PASS
-        # # ==========================================
-
-        # # A. Extract Image Features
-        # # Shape: (1, 256, 64, 64)
-        # image_embeddings = self.SAM.image_encoder(img_1024) 
-
-        # # B. Encode the Point Prompts
-        # # sparse batch size is N (21), dense batch size is N (21)
-        # sparse_embeddings, dense_embeddings = self.SAM.prompt_encoder(
-        #     points=points,
-        #     boxes=None,
-        #     masks=None,
-        # )
-
-        # # C. Decode the Masks
-        # # SAM automatically broadcasts the 1 image to the N prompts!
-        # low_res_masks, iou_predictions = self.SAM.mask_decoder(
-        #     image_embeddings=image_embeddings,  # <-- Pass the original tensor here!
-        #     image_pe=self.SAM.prompt_encoder.get_dense_pe(),
-        #     sparse_prompt_embeddings=sparse_embeddings,
-        #     dense_prompt_embeddings=dense_embeddings,
-        #     multimask_output=False,
-        # )
-
-        # # low_res_masks is now exactly (N, 1, 256, 256)
-        # # Squeeze out the channel dim -> (N, 256, 256)
-        # logits = low_res_masks.squeeze(1)
-
-        # targets = self.exploded_A
-        # if targets.dim() == 4:
-        #     targets = targets.squeeze(0)
-
-        # # # 4. Scale your prompts! 
-        # # # Since we scaled the image from 256 to 1024 (exactly 4x), the centroids must move too.
-        # # scaled_centroids = (self.centroids_A * 4.0).to(fake.device)
-
-        # # # Guarantee it is exactly 3D: (Batch, Num_Points, 2)
-        # # # Reshape from (1, N, 2) -> (N, 1, 2)
-        # # if scaled_centroids.dim() == 3 and scaled_centroids.shape[0] == 1:
-        # #     scaled_centroids = scaled_centroids.squeeze(0).unsqueeze(1)
-        # # elif scaled_centroids.dim() == 2:
-        # #     scaled_centroids = scaled_centroids.unsqueeze(1)
-
-        # # # Extract the batch size (B) and number of points (N)
-        # # N = scaled_centroids.shape[0]
-
-        # # # Create a label (1 = Foreground) for EVERY single point in the batch
-        # # # Shape must be exactly (B, N) -> e.g., (1, 21)
-        # # point_labels = torch.ones((N, 1), dtype=torch.long, device=fake.device)
-
-        # # # Package them as a tuple. NO extra lists or unsqueezes here!
-        # # points = (scaled_centroids, point_labels)
-
-        # # # A. Extract Image Features
-        # # image_embeddings = self.SAM.image_encoder(img_1024)
-
-        # # # B. Encode the Point Prompts
-        # # sparse_embeddings, dense_embeddings = self.SAM.prompt_encoder(
-        # #     points=points,
-        # #     boxes=None,
-        # #     masks=None,
-        # # )
-
-        # # image_embeddings_expanded = image_embeddings.repeat(N, 1, 1, 1)
-
-        # # # C. Decode the Masks (Output is continuous logits!)
-        # # low_res_masks, iou_predictions = self.SAM.mask_decoder(
-        # #     image_embeddings=image_embeddings_expanded,
-        # #     image_pe=self.SAM.prompt_encoder.get_dense_pe(),
-        # #     sparse_prompt_embeddings=sparse_embeddings,
-        # #     dense_prompt_embeddings=dense_embeddings,
-        # #     multimask_output=False,
-        # # )
-
-        # # # low_res_masks shape is (1, 1, 256, 256). These are your RAW LOGITS!
-        # # # Squeeze out the batch and channel dims -> (256, 256) or (N, 256, 256)
-        # # logits = low_res_masks.squeeze(1)
- 
-        # # print(sam_output[0].masks.data.shape, torch.zeros_like(sam_output[0].masks.data).shape)
-
-        # # sam_tensor_output = sam_output[0].masks.data #np.array([x.masks.data for x in sam_output[0]]).astype(bool)
-
-        # # if sam_tensor_output.shape[0] > 0:
-        # #     if sam_tensor_output.dim() == 3:
-        # #         sam_tensor_output = sam_tensor_output.unsqueeze(0)
-
-        # #     # Resize back down to original GAN resolution
-        # #     preds_resized = F.interpolate(sam_tensor_output.float(), size=(256, 256), 
-        # #                                   mode='bilinear', align_corners=False) > 0.5
-
-        # #     # Squeeze the fake batch dimension back out -> (N, 256, 256)
-        # #     sam_tensor_output = preds_resized.squeeze(0)
-
-        # # print(sam_tensor_output.shape)
-        # self.exploded_A = self.exploded_A.to(logits.device)[0]
-
-        # lambda_sam = 10.
-        # # self.loss_SAM = self.compute_sam_loss(logits, self.exploded_A, lambda_sam=0.1)
-        # self.loss_SAM = lambda_sam * sigmoid_focal_loss(
-        #     inputs=logits, 
-        #     targets=self.exploded_A.float(), 
-        #     alpha=0.25, 
-        #     gamma=2.0, 
-        #     reduction='mean'
-        # )
         if epoch > 10:
             fp_centroids = self.get_fp_centroids(fake, targets=self.exploded_A)
 
@@ -375,8 +278,10 @@ class CUTModel(BaseModel):
             self.loss_SAM = self.compute_sam_loss(fake, centroids=all_centroids, targets=all_targets, n_fp=fp_centroids.shape[1], lambda_sam=10)
         else:
             self.loss_SAM = 0
+            self.loss_tp_SAM = 0
+            self.loss_fp_SAM = 0
         
-        self.loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_SAM #+ self.loss_COLOR
+        self.loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_G_cond + self.loss_SAM #+ self.loss_COLOR
         
         return self.loss_G
     
@@ -569,152 +474,6 @@ class CUTModel(BaseModel):
         
         return dice_loss.mean()
     
-    # def compute_iou_matrix(self, masks1, masks2):
-    #     """
-    #     Computes pairwise IoU between two sets of masks efficiently using matrix multiplication.
-        
-    #     Args:
-    #         masks1: Tensor of shape (N, H, W)
-    #         masks2: Tensor of shape (M, H, W)
-    #     Returns:
-    #         iou: Tensor of shape (N, M)
-    #     """
-
-    #     print(">>>", masks1.shape, masks2.shape)
-
-    #     if masks1.shape[0] == 0 or masks2.shape[0] == 0:
-    #         return torch.zeros((masks1.shape[0], masks2.shape[0]), device=masks1.device)
-
-    #     # Flatten spatial dimensions: (N, H*W) and (M, H*W)
-    #     m1 = masks1.view(masks1.shape[0], -1).float()
-    #     m2 = masks2.view(masks2.shape[0], -1).float()
-
-
-
-    #     # Intersection: Matrix multiplication of m1 and m2 transposed -> (N, M)
-    #     intersection = torch.mm(m1, m2.t())
-        
-    #     # Areas: Sum along the spatial dimension
-    #     area1 = m1.sum(dim=1).unsqueeze(1) # (N, 1)
-    #     area2 = m2.sum(dim=1).unsqueeze(0) # (1, M)
-
-    #     # Union = Area1 + Area2 - Intersection
-    #     union = area1 + area2 - intersection
-        
-    #     # Add a small epsilon to prevent division by zero
-    #     iou = intersection / torch.clamp(union, min=1e-8)
-    #     return iou
-
-    def compute_iou_matrix(self, pred_logits, targets, iou_threshold=0.1):
-        # """
-        # Computes pairwise IoU between two sets of masks efficiently.
-        # Automatically handles rogue batch dimensions.
-        # """
-        # # 1. Force both tensors into strict 3D shapes: (Number_of_Masks, H, W)
-        # # This turns (1, 10, 256, 256) into (10, 256, 256) automatically
-        # masks1_3d = masks1.view(-1, masks1.shape[-2], masks1.shape[-1])
-        # masks2_3d = masks2.view(-1, masks2.shape[-2], masks2.shape[-1])
-
-        # N = masks1_3d.shape[0]
-        # M = masks2_3d.shape[0]
-
-        # if N == 0 or M == 0:
-        #     return torch.zeros((N, M), device=masks1.device)
-
-        # # 2. Flatten spatial dimensions: (N, H*W) and (M, H*W)
-        # # m1 = masks1_3d.view(N, -1).float()
-        # with torch.no_grad():
-        #     m1 = (masks1_3d > 0.0).float().view(N, -1)
-        # m2 = masks2_3d.view(M, -1).float()
-
-        # # 3. Intersection: Matrix multiplication of m1 and m2 transposed -> (N, M)
-        # intersection = torch.mm(m1, m2.t())
-        
-        # # 4. Areas: Sum along the spatial dimension
-        # area1 = m1.sum(dim=1).unsqueeze(1) # (N, 1)
-        # area2 = m2.sum(dim=1).unsqueeze(0) # (1, M)
-
-        # # 5. Union = Area1 + Area2 - Intersection
-        # union = area1 + area2 - intersection
-        
-        # # 6. Add a small epsilon to prevent division by zero
-        # iou = intersection / torch.clamp(union, min=1e-8)
-        
-        # return iou
-        """
-        Globally optimal assignment using the Hungarian Algorithm.
-        Symmetrically penalizes unmatched predictions and targets.
-        """
-        device = pred_logits.device
-        N, H, W = pred_logits.shape
-        M = targets.shape[0]
-
-        # --- Edge Cases ---
-        if N == 0 and M == 0:
-            return torch.tensor(0.0, device=device, requires_grad=True)
-        if N == 0:
-            return sigmoid_focal_loss(torch.zeros_like(targets), targets, reduction='mean')
-        if M == 0:
-            return sigmoid_focal_loss(pred_logits, torch.zeros_like(pred_logits), reduction='mean')
-
-        # 1. Compute IoU Matrix
-        iou_matrix = self.compute_iou_matrix(pred_logits, targets) 
-        
-        # 2. Hungarian Assignment (SciPy requires numpy, CPU)
-        # We want to maximize IoU, so we pass negative IoU as the "cost"
-        cost_matrix = -iou_matrix.detach().cpu().numpy()
-        row_ind, col_ind = linear_sum_assignment(cost_matrix)
-
-        # 3. Filter out terrible matches using the threshold
-        match_p = []
-        match_t = []
-        for p_idx, t_idx in zip(row_ind, col_ind):
-            if iou_matrix[p_idx, t_idx] >= iou_threshold:
-                match_p.append(p_idx)
-                match_t.append(t_idx)
-
-        # 4. Figure out total evaluations (N + M - matches)
-        num_matches = len(match_p)
-        total_evals = N + M - num_matches
-        
-        final_preds = torch.zeros((total_evals, H, W), dtype=pred_logits.dtype, device=device)
-        final_targets = torch.zeros((total_evals, H, W), dtype=targets.dtype, device=device)
-
-        # Tracking sets to find unmatched indices
-        matched_p_set = set(match_p)
-        matched_t_set = set(match_t)
-
-        current_idx = 0
-
-        # A. Insert Matches
-        if num_matches > 0:
-            final_preds[:num_matches] = pred_logits[match_p]
-            final_targets[:num_matches] = targets[match_t]
-            current_idx = num_matches
-
-        # B. Insert Unmatched Predictions (False Positives -> penalized vs Zeros)
-        unmatched_p = [i for i in range(N) if i not in matched_p_set]
-        if len(unmatched_p) > 0:
-            end_idx = current_idx + len(unmatched_p)
-            final_preds[current_idx:end_idx] = pred_logits[unmatched_p]
-            current_idx = end_idx
-
-        # C. Insert Unmatched Targets (False Negatives -> penalized vs Zeros)
-        # Notice final_preds remains 0.0 (Logit zero = 50% prob). 
-        # To truly penalize it as a hard negative, we should push the logit very low (e.g., -10)
-        unmatched_t = [i for i in range(M) if i not in matched_t_set]
-        if len(unmatched_t) > 0:
-            end_idx = current_idx + len(unmatched_t)
-            # Deep negative logit = 0% probability prediction
-            final_preds[current_idx:end_idx] = -10.0 
-            final_targets[current_idx:end_idx] = targets[unmatched_t]
-
-        # 5. Compute the final vectorized loss
-        # Using Focal Loss because of the extreme class imbalance in segmentation
-        loss = sigmoid_focal_loss(final_preds, final_targets, alpha=0.25, gamma=2.0, reduction='mean')
-
-        return loss
-    
     def compute_sam_loss(self, fake, centroids, targets, n_fp, lambda_sam=1.):
         fake = (fake + 1.0) / 2.0
         
@@ -793,14 +552,14 @@ class CUTModel(BaseModel):
         tp_weight = 1
         fp_weight = 1
         if 0 < n_fp < targets.shape[0]:
-            sam_loss_tp = self.dice_focal_loss(
+            self.loss_tp_SAM = self.dice_focal_loss(
                 inputs=logits[:-n_fp], 
                 targets=targets[:-n_fp], 
                 alpha=0.25, 
                 gamma=2.0, 
                 reduction='mean'
             )
-            sam_loss_fp = self.dice_focal_loss(
+            self.loss_fp_SAM = self.dice_focal_loss(
                 inputs=logits[n_fp:], 
                 targets=targets[n_fp:], 
                 alpha=0.25, 
@@ -808,17 +567,17 @@ class CUTModel(BaseModel):
                 reduction='mean'
             )
         elif n_fp == 0:
-            sam_loss_tp = self.dice_focal_loss(
+            self.loss_tp_SAM = self.dice_focal_loss(
                 inputs=logits, 
                 targets=targets, 
                 alpha=0.25, 
                 gamma=2.0, 
                 reduction='mean'
             )
-            sam_loss_fp = 0
+            self.loss_fp_SAM = 0
         else:
-            sam_loss_tp = 0
-            sam_loss_fp = self.dice_focal_loss(
+            self.loss_tp_SAM = 0
+            self.loss_fp_SAM = self.dice_focal_loss(
                 inputs=logits, 
                 targets=targets, 
                 alpha=0.25, 
@@ -826,7 +585,7 @@ class CUTModel(BaseModel):
                 reduction='mean'
             )   
       
-        loss = lambda_sam * (tp_weight * sam_loss_tp + fp_weight * sam_loss_fp) #/ (tp_weight + fp_weight)
+        loss = lambda_sam * (tp_weight * self.loss_tp_SAM + fp_weight * self.loss_fp_SAM) #/ (tp_weight + fp_weight)
         
         return loss
 
@@ -1050,3 +809,22 @@ class CUTModel(BaseModel):
         fp_centroids = torch.stack(centroids)[None, ...]
 
         return fp_centroids
+
+    def print_receptive_field(self, network, name="Discriminator"):
+        """
+        Dynamically calculates and prints the receptive field of a sequential CNN.
+        """
+        receptive_field = 1
+        stride_product = 1
+
+        # Loop through all modules in the network
+        for module in network.modules():
+            if isinstance(module, nn.Conv2d):
+                # Assuming square kernels and strides (e.g., 4x4 kernel)
+                k = module.kernel_size[0]
+                s = module.stride[0]
+                
+                receptive_field += (k - 1) * stride_product
+                stride_product *= s
+                
+        print(f"{name} Receptive Field: {receptive_field} x {receptive_field} pixels")

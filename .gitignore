@@ -50,3 +50,4 @@ test/data/legacy_serialized.pt
 *.pt
 stardist_env.yaml
 /experiments/*
+cache_*

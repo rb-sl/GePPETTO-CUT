@@ -73,6 +73,12 @@ class GeppettoDataset(UnalignedDataset):
     def __init__(self, opt):
         super().__init__(opt)
 
+        self.dir_paired =  Path(os.path.join(opt.dataroot, "paired_dataset")) # opt.dir_paired)
+        self.dir_labeled =  Path(os.path.join(opt.dataroot, "labeled_masks")) #  opt.dir_labeled)
+
+        self.paired_A_paths = list((self.dir_paired / "masks").glob("*"))
+        self.paired_B_paths = list((self.dir_paired / "images").glob("*"))
+
     def __getitem__(self, index):
         """Return a data point and its metadata information.
 
@@ -104,22 +110,29 @@ class GeppettoDataset(UnalignedDataset):
         transform = get_transform(modified_opt, grayscale=True)
 
         sample_path = Path(A_path)
-        base_path = list(Path(sample_path.parent.parent.parent).glob("synth_*"))[0]
-        labeled_path = base_path / "train" / "masks" / f"synth_sample_{sample_path.stem.split("_")[-1]}.tif"
+        labeled_path = self.dir_labeled / f"synth_sample_{sample_path.stem.split("_")[-1]}.tif"
         base_mask = Image.fromarray(skio.imread(labeled_path)).convert("RGB")
 
         A, base_mask = transform(A_img, base_mask)  # Applies the same transformation
         B = transform(B_img)
 
+        # SAM GT
         uniques, counts = np.unique(base_mask, return_counts=True)
         uniques = np.delete(uniques, np.argmax(counts))
         A_exploded = base_mask == uniques[:, None, None]
         A_centroids = self.get_centroids(A_exploded)
-        
+
+        # Semi-paired GT
+        i_paired = np.random.randint(len(self.paired_A_paths))
+        A_paired = Image.fromarray(skio.imread(self.paired_A_paths[i_paired]).astype(np.uint8)).convert('RGB')
+        B_paired = Image.fromarray(skio.imread(self.paired_B_paths[i_paired]).astype(np.uint8)).convert('RGB')
+        A_paired, B_paired = transform(A_paired, B_paired)
+
         return {'A': A, 'B': B, 
                 'A_paths': A_path, 'B_paths': B_path, 
-                'A_exploded': A_exploded, 'A_centroids': A_centroids}
-    
+                'A_exploded': A_exploded, 'A_centroids': A_centroids,  # SAM GT
+                'A_paired': A_paired, 'B_paired': B_paired
+                }
     
     def get_centroids(self, masks_onehot):
         """
