@@ -42,6 +42,9 @@ class CUTModel(BaseModel):
         parser.add_argument('--flip_equivariance',
                             type=util.str2bool, nargs='?', const=True, default=False,
                             help="Enforce flip-equivariance as additional regularization. It's used by FastCUT, but not CUT")
+        
+        parser.add_argument('--discriminator', type=str, default="unconditional", choices=["unconditional", "conditional", "dual"], help='discriminator mode')
+        parser.add_argument('--use_sam_after', type=int, default=10, help='Activates the SAM loss computation after the given epoch')
 
         parser.set_defaults(pool_size=0)  # no image pooling
 
@@ -65,7 +68,7 @@ class CUTModel(BaseModel):
 
         # specify the training losses you want to print out.
         # The training/test scripts will call <BaseModel.get_current_losses>
-        self.loss_names = ['G_GAN', 'D_real', 'D_fake', 'G', 'NCE', "SAM", "tp_SAM", "fp_SAM", "G_cond", "D_cond"]
+        self.loss_names = ['G_GAN', 'D_real', 'D_fake', 'G', 'NCE', "SAM", "tp_SAM", "fp_SAM", "G_cond", "D_cond", "D_cond_real", "D_cond_fake"]
         self.visual_names = ['real_A', 'fake_B', 'real_B']
         self.nce_layers = [int(i) for i in self.opt.nce_layers.split(',')]
 
@@ -74,7 +77,12 @@ class CUTModel(BaseModel):
             self.visual_names += ['idt_B']
 
         if self.isTrain:
-            self.model_names = ['G', 'F', 'D']
+            self.discriminator_mode = opt.discriminator
+            self.model_names = ['G', 'F']
+            if self.discriminator_mode in ["dual", "unconditional"]:
+                self.model_names.append('D')
+            if self.discriminator_mode in ["dual", "conditional"]:
+                self.model_names.append('D_cond')    
         else:  # during test time, only load G
             self.model_names = ['G']
 
@@ -85,13 +93,17 @@ class CUTModel(BaseModel):
         self.print_receptive_field(self.netG, "Generator")
 
         if self.isTrain:
-            self.netD = networks.define_D(opt.output_nc, opt.ndf, opt.netD, opt.n_layers_D, opt.normD, opt.init_type, opt.init_gain, opt.no_antialias, self.gpu_ids, opt)
-            self.print_receptive_field(self.netD, "Unconditional discriminator")
+            if self.discriminator_mode in ["dual", "unconditional"]:
+                self.netD = networks.define_D(opt.output_nc, opt.ndf, opt.netD, opt.n_layers_D, opt.normD, opt.init_type, opt.init_gain, opt.no_antialias, self.gpu_ids, opt)
+                self.print_receptive_field(self.netD, "Unconditional discriminator")
+            else:
+                self.netD = None
+                print("Unconditional discriminator not set")
 
-            cond_input_nc = opt.input_nc + opt.output_nc
-            self.netD_cond = networks.define_D(cond_input_nc, opt.ndf, opt.netD, opt.n_layers_D, opt.normD, opt.init_type, opt.init_gain, opt.no_antialias, self.gpu_ids, opt)
-            self.print_receptive_field(self.netD_cond, "Conditional discriminator")
-
+            if self.discriminator_mode in ["dual", "conditional"]:
+                cond_input_nc = opt.input_nc + opt.output_nc
+                self.netD_cond = networks.define_D(cond_input_nc, opt.ndf, opt.netD, opt.n_layers_D + 3, opt.normD, opt.init_type, opt.init_gain, opt.no_antialias, self.gpu_ids, opt)
+                self.print_receptive_field(self.netD_cond, "Conditional discriminator")
 
             # define loss functions
             self.criterionGAN = networks.GANLoss(opt.gan_mode).to(self.device)
@@ -102,11 +114,15 @@ class CUTModel(BaseModel):
 
             self.criterionIdt = torch.nn.L1Loss().to(self.device)
             self.optimizer_G = torch.optim.Adam(self.netG.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
-            self.optimizer_D = torch.optim.Adam(self.netD.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
-            self.optimizer_D_cond = torch.optim.Adam(self.netD_cond.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
             self.optimizers.append(self.optimizer_G)
-            self.optimizers.append(self.optimizer_D)
-            self.optimizers.append(self.optimizer_D_cond)
+
+            if self.discriminator_mode in ["dual", "unconditional"]:
+                self.optimizer_D = torch.optim.Adam(self.netD.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
+                self.optimizers.append(self.optimizer_D)
+
+            if self.discriminator_mode in ["dual", "conditional"]:
+                self.optimizer_D_cond = torch.optim.Adam(self.netD_cond.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
+                self.optimizers.append(self.optimizer_D_cond)
             
             # self.SAM = SAM("sam2_b.pt")
             self.SAM = sam_model_registry["vit_b"](checkpoint="sam_vit_b_01ec64.pth" if not hasattr(opt, 'sam_path') else opt.sam_path)
@@ -114,6 +130,7 @@ class CUTModel(BaseModel):
             for param in self.SAM.parameters():
                 param.requires_grad = False
             self.SAM.eval()
+            self.SAM_epoch = opt.use_sam_after
             
 
     def data_dependent_initialize(self, data):
@@ -143,17 +160,25 @@ class CUTModel(BaseModel):
         self.forward()
 
         # update D
-        self.set_requires_grad(self.netD, True)
-        self.set_requires_grad(self.netD_cond, True)
-        self.optimizer_D.zero_grad()
-        self.optimizer_D_cond.zero_grad()
+        if self.discriminator_mode in ["dual", "unconditional"]:
+            self.set_requires_grad(self.netD, True)
+            self.optimizer_D.zero_grad()
+        if self.discriminator_mode in ["dual", "conditional"]:
+            self.set_requires_grad(self.netD_cond, True)
+            self.optimizer_D_cond.zero_grad()
+            
         self.compute_D_loss().backward()
-        self.optimizer_D.step()
-        self.optimizer_D_cond.step()
+
+        if self.discriminator_mode in ["dual", "unconditional"]:
+            self.optimizer_D.step()
+        if self.discriminator_mode in ["dual", "conditional"]:
+            self.optimizer_D_cond.step()
 
         # update G
-        self.set_requires_grad(self.netD, False)
-        self.set_requires_grad(self.netD_cond, False)
+        if self.discriminator_mode in ["dual", "unconditional"]:
+            self.set_requires_grad(self.netD, False)
+        if self.discriminator_mode in ["dual", "conditional"]:
+            self.set_requires_grad(self.netD_cond, False)
         self.optimizer_G.zero_grad()
         if self.opt.netF == 'mlp_sample':
             self.optimizer_F.zero_grad()
@@ -196,35 +221,53 @@ class CUTModel(BaseModel):
     def compute_D_loss(self):
         """Calculate GAN loss for the discriminator"""
         fake = self.fake_B.detach()
-        # Fake; stop backprop to the generator by detaching fake_B
-        pred_fake = self.netD(fake)
-        self.loss_D_fake = self.criterionGAN(pred_fake, False).mean()
-        # Real
-        self.pred_real = self.netD(self.real_B)
-        loss_D_real = self.criterionGAN(self.pred_real, True)
-        self.loss_D_real = loss_D_real.mean()
 
-        # combine loss and calculate gradients
-        self.loss_D = (self.loss_D_fake + self.loss_D_real) * 0.5
+        self.loss_D = 0
+        if self.discriminator_mode in ["dual", "unconditional"]:
+            # Fake; stop backprop to the generator by detaching fake_B
+            pred_fake = self.netD(fake)
+            self.loss_D_fake = self.criterionGAN(pred_fake, False).mean()
+            # Real
+            self.pred_real = self.netD(self.real_B)
+            loss_D_real = self.criterionGAN(self.pred_real, True)
+            self.loss_D_real = loss_D_real.mean()
+
+            # combine loss and calculate gradients
+            self.loss_D = (self.loss_D_fake + self.loss_D_real) * 0.5
 
         self.loss_D_cond = 0.0
+        self.loss_D_cond_fake = 0.0
+        self.loss_D_cond_real = 0.0
             
         # Only compute this if paired data was provided in this batch
         if hasattr(self, 'A_paired') and hasattr(self, 'B_paired'):
-            # Generate fake image from the PAIRED mask
-            fake_B_paired = self.netG(self.A_paired)
-            
-            # Concatenate Mask + Fake Image
-            fake_AB = torch.cat((self.A_paired, fake_B_paired), dim=1)
-            pred_fake_cond = self.netD_cond(fake_AB.detach())
-            loss_D_cond_fake = self.criterionGAN(pred_fake_cond, False).mean()
+            if self.discriminator_mode == "dual":
+                # Generate fake image from the PAIRED mask
+                fake_B_paired = self.netG(self.A_paired)                
+                # Concatenate Mask + Fake Image
+                fake_paired = torch.cat((self.A_paired, fake_B_paired), dim=1)
+                pred_fake_cond = self.netD_cond(fake_paired.detach())
+                self.loss_D_cond_fake = self.criterionGAN(pred_fake_cond, False).mean()
 
-            # Concatenate Mask + Real Image
-            real_AB = torch.cat((self.A_paired, self.B_paired), dim=1)
-            pred_real_cond = self.netD_cond(real_AB)
-            loss_D_cond_real = self.criterionGAN(pred_real_cond, True).mean()
-            
-            self.loss_D_cond = (loss_D_cond_fake + loss_D_cond_real) * 0.5
+                # Concatenate Mask + Real Image
+                real_AB = torch.cat((self.A_paired, self.B_paired), dim=1)
+                pred_real_cond = self.netD_cond(real_AB)
+                self.loss_D_cond_real = self.criterionGAN(pred_real_cond, True).mean()
+                
+                self.loss_D_cond = (self.loss_D_cond_fake + self.loss_D_cond_real) * 0.5
+            elif self.discriminator_mode == "conditional":
+                fake_AB = torch.cat((self.real_A, fake), dim=1)
+                pred_fake = self.netD_cond(fake_AB)
+
+                self.loss_D_cond_fake = self.criterionGAN(pred_fake, False).mean()
+                # Real
+                real_AB = torch.cat((self.A_paired, self.B_paired), dim=1)
+                self.pred_real = self.netD_cond(real_AB)
+                self.loss_D_cond_real = self.criterionGAN(self.pred_real, True)
+                self.loss_D_cond_real = loss_D_real.mean()
+
+                # combine loss and calculate gradients
+                self.loss_D_cond = (self.loss_D_cond_fake + self.loss_D_cond_real) * 0.5
         
         return self.loss_D + self.loss_D_cond
 
@@ -232,7 +275,7 @@ class CUTModel(BaseModel):
         """Calculate GAN and NCE loss for the generator"""
         fake = self.fake_B
         # First, G(A) should fake the discriminator
-        if self.opt.lambda_GAN > 0.0:
+        if self.opt.lambda_GAN > 0.0 and self.discriminator_mode in ["dual", "unconditional"]:
             pred_fake = self.netD(fake)
             self.loss_G_GAN = self.criterionGAN(pred_fake, True).mean() * self.opt.lambda_GAN
         else:
@@ -251,31 +294,33 @@ class CUTModel(BaseModel):
 
         # 2. Fool Conditional D (Structure)
         self.loss_G_cond = 0.0
-        if hasattr(self, 'A_paired') and hasattr(self, 'B_paired'):
+        if hasattr(self, 'A_paired') and hasattr(self, 'B_paired') \
+              and self.discriminator_mode in ["dual", "conditional"]:
             fake_B_paired = self.netG(self.A_paired)
             fake_AB = torch.cat((self.A_paired, fake_B_paired), dim=1)
             
             # Generator wants D_cond to classify this as TRUE
             # We apply a HIGH weight (e.g., lambda_cond = 5.0) because 
             # paired data is rare and must be respected!
-            lambda_cond = 5.0 
+            lambda_cond = 5 if epoch < 50 else 20  #self.opt.lambda_GAN if not "dual" else 5
             self.loss_G_cond = self.criterionGAN(self.netD_cond(fake_AB), True).mean() * lambda_cond
 
         # TODO assuming batch = 1
 
-        if epoch > 10:
-            fp_centroids = self.get_fp_centroids(fake, targets=self.exploded_A)
+        if epoch > self.SAM_epoch:
+            # fp_centroids = self.get_fp_centroids(fake, targets=self.exploded_A)
 
-            if fp_centroids.shape[1] > 0:
-                # Append false positive centroids to real centroids
-                all_centroids = torch.cat([self.centroids_A.to(fake.device), fp_centroids], dim=1)
-                # Append fake targets (all zeros) to match the FP centroids
-                all_targets = torch.cat([self.exploded_A, torch.zeros((1, fp_centroids.shape[1], *self.exploded_A.shape[2:]))], dim=1)  # batch_size, 
-            else:
-                all_centroids = self.centroids_A.to(fake.device)
-                all_targets = self.exploded_A
+            # if fp_centroids.shape[1] > 0:
+            #     # Append false positive centroids to real centroids
+            #     all_centroids = torch.cat([self.centroids_A.to(fake.device), fp_centroids], dim=1)
+            #     # Append fake targets (all zeros) to match the FP centroids
+            #     all_targets = torch.cat([self.exploded_A, torch.zeros((1, fp_centroids.shape[1], *self.exploded_A.shape[2:]))], dim=1)  # batch_size, 
+            # else:
+            #     all_centroids = self.centroids_A.to(fake.device)
+            #     all_targets = self.exploded_A
                 
-            self.loss_SAM = self.compute_sam_loss(fake, centroids=all_centroids, targets=all_targets, n_fp=fp_centroids.shape[1], lambda_sam=10)
+            # self.loss_SAM = self.compute_sam_loss(fake, centroids=all_centroids, targets=all_targets, n_fp=fp_centroids.shape[1], lambda_sam=10)
+            self.loss_SAM = self.compute_sam_loss(fake, centroids=self.centroids_A.to(fake.device), targets=self.exploded_A, n_fp=0, lambda_sam=1)
         else:
             self.loss_SAM = 0
             self.loss_tp_SAM = 0
@@ -550,7 +595,7 @@ class CUTModel(BaseModel):
         # )
 
         tp_weight = 1
-        fp_weight = 1
+        fp_weight = 0
         if 0 < n_fp < targets.shape[0]:
             self.loss_tp_SAM = self.dice_focal_loss(
                 inputs=logits[:-n_fp], 
@@ -589,91 +634,6 @@ class CUTModel(BaseModel):
         
         return loss
 
-
-    # def compute_sam_loss(self, preds, targets, iou_threshold=0., lambda_sam=1.):
-        # """
-        # Symmetric Greedy Assignment.
-        # Penalizes both False Positives (unmatched preds) and False Negatives (unmatched targets)
-        # by evaluating exactly (N + M - matches) elements.
-        # """
-        # device = preds.device
-        # N, H, W = preds.shape
-        # M = targets.shape[0]
-
-        # # --- Fast-path Edge Cases ---
-        # if N == 0 and M == 0:
-        #     return torch.tensor(0.0, device=device, requires_grad=True)
-        # if N == 0:
-        #     # 0 preds, M targets -> All False Negatives
-        #     return self.compute_dice_loss(torch.zeros_like(targets), targets)
-        # if M == 0:
-        #     # N preds, 0 targets -> All False Positives
-        #     return self.compute_dice_loss(preds, torch.zeros_like(preds))
-
-        # # 1. Compute IoU and Sort
-        # iou_matrix = self.compute_iou_matrix(preds, targets) 
-        # flat_iou = iou_matrix.view(-1)
-        # sorted_iou, sorted_indices = torch.sort(flat_iou, descending=True)
-
-        # pred_assigned = torch.zeros(N, dtype=torch.bool, device=device)
-        # target_assigned = torch.zeros(M, dtype=torch.bool, device=device)
-
-        # pred_indices = sorted_indices // M
-        # target_indices = sorted_indices % M
-
-        # match_p = []
-        # match_t = []
-
-        # # 2. Greedy Assignment
-        # for p_idx, t_idx, iou in zip(pred_indices, target_indices, sorted_iou):
-        #     if iou < iou_threshold:
-        #         break 
-                
-        #     p = p_idx.item()
-        #     t = t_idx.item()
-            
-        #     if not pred_assigned[p] and not target_assigned[t]:
-        #         match_p.append(p)
-        #         match_t.append(t)
-        #         pred_assigned[p] = True
-        #         target_assigned[t] = True
-
-        # # 3. Pre-allocate aligned tensors based on total required evaluations
-        # num_matches = len(match_p)
-        # total_evals = N + M - num_matches
-        
-        # # Initialize with zeros. Unmatched items will default to comparing against these zeros!
-        # final_preds = torch.zeros((total_evals, H, W), dtype=preds.dtype, device=device)
-        # final_targets = torch.zeros((total_evals, H, W), dtype=targets.dtype, device=device)
-
-        # current_idx = 0
-
-        # # 4. Insert True Matches
-        # if num_matches > 0:
-        #     final_preds[:num_matches] = preds[match_p]
-        #     final_targets[:num_matches] = targets[match_t]
-        #     current_idx = num_matches
-
-        # # 5. Insert Unmatched Predictions (False Positives)
-        # # Their counterpart in final_targets remains zero.
-        # unmatched_p = torch.where(~pred_assigned)[0]
-        # if len(unmatched_p) > 0:
-        #     end_idx = current_idx + len(unmatched_p)
-        #     final_preds[current_idx:end_idx] = preds[unmatched_p]
-        #     current_idx = end_idx
-
-        # # 6. Insert Unmatched Targets (False Negatives)
-        # # Their counterpart in final_preds remains zero.
-        # unmatched_t = torch.where(~target_assigned)[0]
-        # if len(unmatched_t) > 0:
-        #     end_idx = current_idx + len(unmatched_t)
-        #     final_targets[current_idx:end_idx] = targets[unmatched_t]
-
-        # # 7. Compute a single, highly optimized Vectorized BCE Loss over all cases
-        # loss = self.compute_dice_loss(final_preds, final_targets)
-
-        # return lambda_sam * loss
-
     def get_fp_centroids(self, fake, targets):
         fake = (fake + 1) / 2
         targets = targets.to(fake.device)
@@ -692,9 +652,7 @@ class CUTModel(BaseModel):
 
         # print(fp_centroids)
 
-        return fp_centroids
-        
-        
+        return fp_centroids      
 
     def get_contrast_anomalies(self, masked_image, z_threshold=2.0):
         local_mean = torch.mean(masked_image)
@@ -811,20 +769,57 @@ class CUTModel(BaseModel):
         return fp_centroids
 
     def print_receptive_field(self, network, name="Discriminator"):
-        """
-        Dynamically calculates and prints the receptive field of a sequential CNN.
-        """
-        receptive_field = 1
-        stride_product = 1
+        # """
+        # Dynamically calculates and prints the receptive field of a sequential CNN.
+        # """
+        # receptive_field = 1
+        # stride_product = 1
 
-        # Loop through all modules in the network
+        # # Loop through all modules in the network
+        # for module in network.modules():
+        #     if isinstance(module, nn.Conv2d):
+        #         # Assuming square kernels and strides (e.g., 4x4 kernel)
+        #         k = module.kernel_size[0]
+        #         s = module.stride[0]
+                
+        #         receptive_field += (k - 1) * stride_product
+        #         stride_product *= s
+                
+        # print(f"{name} Receptive Field: {receptive_field} x {receptive_field} pixels")
+        # # from torchscan import summary
+        # # summary(network, (1, 256, 256), receptive_field=True, max_depth=0)
+
+    # def get_true_receptive_field(network, name="Discriminator"):
+        """
+        Dynamically computes the receptive field by inspecting the actual 
+        kernel sizes and strides of convolutions and pooling layers.
+        Assumes no parameters and tracks Height and Width independently.
+        """
+        # [Height, Width]
+        rf = [1, 1]   
+        jump = [1, 1] 
+
         for module in network.modules():
-            if isinstance(module, nn.Conv2d):
-                # Assuming square kernels and strides (e.g., 4x4 kernel)
-                k = module.kernel_size[0]
-                s = module.stride[0]
+            # Look for any layer that alters the spatial field of view
+            if isinstance(module, (nn.Conv2d, nn.MaxPool2d, nn.AvgPool2d)):
                 
-                receptive_field += (k - 1) * stride_product
-                stride_product *= s
+                # Extract kernel size (safely handle int vs tuple)
+                k = module.kernel_size
+                k = (k, k) if isinstance(k, int) else k
                 
-        print(f"{name} Receptive Field: {receptive_field} x {receptive_field} pixels")
+                # Extract stride (safely handle int vs tuple vs None)
+                s = module.stride
+                s = (s, s) if isinstance(s, int) else s
+                if s is None or s == (): 
+                    s = k if isinstance(module, (nn.MaxPool2d, nn.AvgPool2d)) else (1, 1)
+                
+                # 1. Update Receptive Field: R = R + (Kernel - 1) * Jump
+                rf[0] += (k[0] - 1) * jump[0]
+                rf[1] += (k[1] - 1) * jump[1]
+                
+                # 2. Update Jump: Jump = Jump * Stride
+                jump[0] *= s[0]
+                jump[1] *= s[1]
+
+        print(f"{name} Receptive Field: {rf[0]} x {rf[1]} pixels")
+        return rf

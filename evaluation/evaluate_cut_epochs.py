@@ -91,13 +91,13 @@ if __name__ == '__main__':
     opt.masks_path = Path("/mnt/experiments/robertob98/GePPETTO_DET/outputs_conv/test_sam_gen/synth_BBBC039_split_norm_tiled_allimages_100maskedtiles_256_0/train/masks")
     opt.gen_path = Path("/home/robertob98/GePPETTO-DET-project/external/GePPETTO-CUT/cache_fid_gen")
     opt.geppetto_python = "/home/robertob98/envs/geppetto_env/bin/python"
-    opt.geppetto_home = Path("/home/robertob98/GePPETTO-DET/")
-    opt.geppetto_output = Path("/mnt/experiments/robertob98/GePPETTO_DET/outputs_eval/")
+    opt.geppetto_home = Path("/home/robertob98/GePPETTO-DET-project/GePPETTO-DET/")
+    opt.geppetto_output = Path("/mnt/experiments/robertob98/GePPETTO-DET-project/GePPETTO_DET/outputs_eval/")
     opt.dataroot = "/mnt/experiments/robertob98/GePPETTO_DET/outputs_conv/test_sam/cutBBBC039_split_norm_tiled_allimages_100maskedtiles_256_0"
     opt.dataset_mode = "geppetto"
 
-    opt.CUT_checkpoints_dir = "/mnt/experiments/robertob98/CUT/"
-    opt.CUT_name = "CUT_dicefocal_nospaced"
+    opt.CUT_checkpoints_dir = Path("/mnt/experiments/robertob98/CUT/")
+    opt.CUT_name = "CUT_test"
     
     random.seed(opt.seed)
     np.random.seed(opt.seed)
@@ -150,7 +150,10 @@ if __name__ == '__main__':
     sam_fp_loss_history = {}
     n_false_positives_history = {}
     fid_history = {}
-    for epoch in range(5, 101, 5):
+
+    generator_weights = list((opt.CUT_checkpoints_dir / opt.CUT_name).glob("[0-9]*_net_G.pth"))
+    epoch_list = sorted([int(w.stem.split('_')[0]) for w in generator_weights])
+    for epoch in epoch_list:  # TODO read actual file list
         print(">>> Epoch", epoch)
         # Update the configuration to use the current epoch
         with open(opt.geppetto_config_path, "r") as f:
