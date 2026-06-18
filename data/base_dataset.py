@@ -117,6 +117,13 @@ def get_transform(opt, params=None, grayscale=False, method=Image.BICUBIC, conve
     # if opt.preprocess == 'none':
     transform_list.append(transforms.Lambda(lambda img: __make_power_2(img, base=4, method=method)))
 
+    if opt.isTrain:
+        transform_list.append(transforms.RandomPhotometricDistort(brightness=(0.6, 1.4), 
+                                                                  contrast=(0.7, 1.3), 
+                                                                  saturation=(1, 1), 
+                                                                  hue=(0, 0), p=0.9))
+
+
     if not opt.no_flip:
         if params is None or 'flip' not in params:
             transform_list.append(transforms.RandomHorizontalFlip())

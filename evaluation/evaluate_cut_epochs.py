@@ -168,7 +168,7 @@ if __name__ == '__main__':
             geppetto_conf = json.dump(geppetto_conf, f)     
 
         # Call and wait for GePPETTO-DET
-        subprocess.Popen(geppetto_command, 
+        subprocess.Popen(geppetto_command, # + ["--discard_previous"] if epoch==5 else geppetto_command, 
                          cwd=opt.geppetto_home, 
                          env=geppetto_env).wait()
 

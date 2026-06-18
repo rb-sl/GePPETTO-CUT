@@ -302,6 +302,14 @@ class CUTModel(BaseModel):
             # Generator wants D_cond to classify this as TRUE
             # We apply a HIGH weight (e.g., lambda_cond = 5.0) because 
             # paired data is rare and must be respected!
+            # if epoch < 30:
+            #     lambda_cond = 0
+            # elif epoch < 60:
+            #     lambda_cond = 10
+            # elif epoch < 80:
+            #     lambda_cond = 20
+            # else:
+            #     lambda_cond = 40
             lambda_cond = 5 if epoch < 50 else 20  #self.opt.lambda_GAN if not "dual" else 5
             self.loss_G_cond = self.criterionGAN(self.netD_cond(fake_AB), True).mean() * lambda_cond
 

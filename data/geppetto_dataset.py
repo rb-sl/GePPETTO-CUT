@@ -10,6 +10,8 @@ import numpy as np
 from pathlib import Path
 from skimage import io as skio
 # from torchvision import io as tvio
+import torchvision.transforms.v2.functional as TF
+
 
 # import matplotlib.pyplot as plt
 import numpy as np
@@ -109,18 +111,19 @@ class GeppettoDataset(UnalignedDataset):
         modified_opt = util.copyconf(self.opt, load_size=self.opt.crop_size if is_finetuning else self.opt.load_size)
         transform = get_transform(modified_opt, grayscale=True)
 
-        sample_path = Path(A_path)
-        labeled_path = self.dir_labeled / f"synth_sample_{sample_path.stem.split("_")[-1]}.tif"
-        base_mask = Image.fromarray(skio.imread(labeled_path)).convert("RGB")
+        # sample_path = Path(A_path)
+        # labeled_path = self.dir_labeled / f"synth_sample_{sample_path.stem.split("_")[-1]}.tif"
+        # base_mask = Image.fromarray(skio.imread(labeled_path)).convert("RGB")
 
-        A, base_mask = transform(A_img, base_mask)  # Applies the same transformation
+        # A, base_mask = transform(A_img, base_mask)  # Applies the same transformation
+        A = transform(A_img)
         B = transform(B_img)
 
         # SAM GT
-        uniques, counts = np.unique(base_mask, return_counts=True)
-        uniques = np.delete(uniques, np.argmax(counts))
-        A_exploded = base_mask == uniques[:, None, None]
-        A_centroids = self.get_centroids(A_exploded)
+        # uniques, counts = np.unique(base_mask, return_counts=True)
+        # uniques = np.delete(uniques, np.argmax(counts))
+        # A_exploded = base_mask == uniques[:, None, None]
+        # A_centroids = self.get_centroids(A_exploded)
 
         # Semi-paired GT
         i_paired = np.random.randint(len(self.paired_A_paths))
@@ -128,9 +131,31 @@ class GeppettoDataset(UnalignedDataset):
         B_paired = Image.fromarray(skio.imread(self.paired_B_paths[i_paired]).astype(np.uint8)).convert('RGB')
         A_paired, B_paired = transform(A_paired, B_paired)
 
+        # Random affine 
+        if self.opt.isTrain:
+            A = self.synchronized_affine(A, interp_mode_A=TF.InterpolationMode.NEAREST)
+            B = self.synchronized_affine(B, interp_mode_A=TF.InterpolationMode.BILINEAR)
+            A_paired, B_paired = self.synchronized_affine(A_paired, B_paired, interp_mode_A=TF.InterpolationMode.NEAREST)
+
+        # from matplotlib import pyplot as plt
+        # plt.figure(figsize=(10, 10))
+        # plt.subplot(221)
+        # plt.imshow(A[0], cmap='gray')
+        # plt.title("A")
+        # plt.subplot(222)
+        # plt.imshow(B[0], cmap='gray')
+        # plt.title("B")
+        # plt.subplot(223)
+        # plt.imshow(A_paired[0], cmap='gray')
+        # plt.title("A_paired")
+        # plt.subplot(224)
+        # plt.imshow(B_paired[0], cmap='gray')
+        # plt.title("B_paired")
+        # plt.savefig(f"examples/{i_paired}.png")
+
         return {'A': A, 'B': B, 
                 'A_paths': A_path, 'B_paths': B_path, 
-                'A_exploded': A_exploded, 'A_centroids': A_centroids,  # SAM GT
+                # 'A_exploded': A_exploded, 'A_centroids': A_centroids,  # SAM GT
                 'A_paired': A_paired, 'B_paired': B_paired
                 }
     
@@ -165,3 +190,33 @@ class GeppettoDataset(UnalignedDataset):
         centroids = np.stack((cent_x, cent_y), axis=1).astype(int)
 
         return centroids
+       
+    def synchronized_affine(self, image, mask=None, interp_mode_A=TF.InterpolationMode.BILINEAR, reflect_size=200):
+        # Augmentation parameters sampling
+        angle = random.uniform(0.0, 360.0)
+        image_side = image.shape[-1]
+        max_dx = 0.2 * image_side
+        max_dy = 0.2 * image_side
+        translate = [int(random.uniform(-max_dx, max_dx)), 
+                    int(random.uniform(-max_dy, max_dy))]
+        scale = random.uniform(0.8, 1.2)
+        shear = random.uniform(-10, 10)
+
+        side_center = (image_side + 2 * reflect_size) / 2
+        rotation_center = (side_center, side_center)
+
+        # Pad and crop for reflection of nuclei before rotation / translation / zoom
+        image_pad = TF.pad(image, padding=reflect_size, padding_mode="reflect")
+        A_aug = TF.affine(image_pad, angle, translate, scale, shear, 
+                        interpolation=interp_mode_A, fill=0, center=rotation_center) # CUT usually pads with 0 for reflect prep
+        A_aug_crop = TF.crop(A_aug, reflect_size, reflect_size, image_side, image_side)
+
+        if mask is not None:
+            mask_pad = TF.pad(mask, padding=reflect_size, padding_mode="reflect")
+            B_aug = TF.affine(mask_pad, angle, translate, scale, shear, 
+                            interpolation=TF.InterpolationMode.BILINEAR, fill=0, center=rotation_center)
+            B_aug_crop = TF.crop(B_aug, reflect_size, reflect_size, image_side, image_side)
+            
+            return A_aug_crop, B_aug_crop
+        
+        return A_aug_crop
